@@ -1,0 +1,9 @@
+pandas==1.4.1
+tqdm==4.63.1
+tensorflow==2.7.1
+tensorflow-hub==0.12.0
+numpy==1.22.3
+pytz==2022.1
+numpy==1.22.3
+pytz==2022.1
+seaborn==0.11.2
