@@ -18,19 +18,21 @@ import tensorflow as tf
 import pandas as pd
 import numpy as np
 import os
+import time
 
 
 # Global vars:
 EPOCHS = 25
-PATIENCE = 12
+PATIENCE = 5
 RANDOM_SEED = 420
-SEQ_LEN = 36
+SEQ_LEN = 288
 BATCH_SIZE = 32
-TARGETS = 10
+TARGETS = 36
 FEATURES = 2
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
 AUTOTUNE = tf.data.AUTOTUNE
+plt.style.use('dark_background')
 
 
 def get_model_version_name(model_name: str) -> str:
@@ -118,18 +120,32 @@ def train_model(model: tf.keras.models.Model, train_ds, val_ds) -> tf.keras.mode
     return model
 
 
+def plot_results(x_values: np.array, y_true: np.array, predictions: np.array):
+    """ Pass in some predictions and plot results against ground truth values. """
+    features = dict(zip(list(range(0, len(x_values))), x_values))
+    true_labels = dict(zip(list(range(len(x_values), len(x_values) + len(y_true))), y_true))
+    predicted_labels = dict(zip(list(range(len(x_values), len(x_values) + len(y_true))), predictions))
+
+    plt.plot(list(features.keys()), list(features.values()))
+    plt.plot(list(true_labels.keys()), list(true_labels.values()), 'y--')
+    plt.plot(list(predicted_labels.keys()), list(predicted_labels.values()), 'r--')
+    return plt.show()
+
+
 def dev():
     """ Test some shit. """
     # Train baseline model:
     X_train, X_val, X_test = fetch_dataset()
     # model = get_baseline_regressor()
     # model = train_model(model, X_train, X_val)
-    model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220411-194450.h5')
+    model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
 
-    for x, y in X_test.take(1):
-        # Plot some predictions:
-        plt.plot(np.reshape(y[0], (-1)), 'b-')
-        plt.plot(model.predict(np.reshape(x[0], (1, SEQ_LEN, FEATURES)))[0], 'ro')
+    for x, y in X_test.shuffle(1000).take(3):
+        features = [z[0].numpy() for z in x[0]]
+        labels = np.reshape(y[0], TARGETS)
+        predictions = model.predict(np.reshape(x[0], (1, SEQ_LEN, FEATURES)))[0]
+        plot_results(features, labels, predictions)
+        time.sleep(3)
 
     return {}
 
