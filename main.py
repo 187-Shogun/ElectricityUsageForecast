@@ -23,12 +23,13 @@ import os
 
 # Global vars:
 EPOCHS = 100
-PATIENCE = 6
+PATIENCE = 10
 RANDOM_SEED = 420
 SEQ_LEN = 288
 BATCH_SIZE = 32
-TARGETS = 36
+TARGETS = 18
 FEATURES = 2
+CONV_SIZE = 16
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
 SCALER = StandardScaler()
@@ -135,13 +136,19 @@ def get_baseline_regressor() -> tf.keras.models.Model:
     return model
 
 
-def get_recurrent_network() -> tf.keras.models.Model:
-    """ Build a recurrent network using LSTM cells. """
+def get_custom_network() -> tf.keras.models.Model:
+    """ Build a custom network. """
     # Assemble the model:
     model = tf.keras.models.Sequential(
-        name='LSTM-RNN',
+        name='Custom-DNN',
         layers=[
-            tf.keras.layers.LSTM(SEQ_LEN, input_shape=[SEQ_LEN, FEATURES]),
+            tf.keras.layers.Flatten(input_shape=[SEQ_LEN, FEATURES]),
+            tf.keras.layers.Dense(SEQ_LEN, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(SEQ_LEN*2, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(SEQ_LEN, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
             tf.keras.layers.Dense(TARGETS)
         ]
     )
@@ -149,7 +156,55 @@ def get_recurrent_network() -> tf.keras.models.Model:
     # Compile it and return it:
     model.compile(
         loss='mae',
+        optimizer=tf.keras.optimizers.SGD(lr=0.03, momentum=0.9, nesterov=True)
+    )
+    return model
+
+
+def get_wavenet() -> tf.keras.models.Model:
+    """ Build a custom network. """
+    # Assemble the model:
+    model = tf.keras.models.Sequential(name='Wavenet-CNN')
+    model.add(tf.keras.layers.InputLayer(input_shape=[SEQ_LEN, FEATURES]))
+    for rate in (1, 2, 4, 8, 16, 32, 64, 128) * 2:
+        model.add(
+            tf.keras.layers.Conv1D(
+                filters=CONV_SIZE,
+                kernel_size=2,
+                padding='causal',
+                activation='relu',
+                dilation_rate=rate
+            )
+        )
+
+    model.add(tf.keras.layers.Conv1D(filters=TARGETS, kernel_size=1))
+    model.add(tf.keras.layers.GlobalAveragePooling1D())
+    model.add(tf.keras.layers.Dense(TARGETS))
+
+    # Compile it and return it:
+    model.compile(
+        loss='mae',
         optimizer=tf.keras.optimizers.Adam()
+    )
+    return model
+
+
+def get_recurrent_network() -> tf.keras.models.Model:
+    """ Build a recurrent network using LSTM cells. """
+    # Assemble the model:
+    model = tf.keras.models.Sequential(
+        name='LSTM-RNN',
+        layers=[
+            tf.keras.layers.LSTM(SEQ_LEN, input_shape=[SEQ_LEN, FEATURES], dropout=0.2, return_sequences=True),
+            tf.keras.layers.LSTM(SEQ_LEN, dropout=0.2),
+            tf.keras.layers.Dense(TARGETS)
+        ]
+    )
+
+    # Compile it and return it:
+    model.compile(
+        loss='mae',
+        optimizer=tf.keras.optimizers.RMSprop(momentum=0.9)
     )
     return model
 
