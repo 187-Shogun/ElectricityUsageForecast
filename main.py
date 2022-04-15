@@ -25,10 +25,10 @@ import os
 EPOCHS = 100
 PATIENCE = 10
 RANDOM_SEED = 420
-SEQ_LEN = 288
+SEQ_LEN = 432
 BATCH_SIZE = 32
 TARGETS = 18
-FEATURES = 2
+FEATURES = 33
 CONV_SIZE = 16
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
@@ -74,19 +74,21 @@ def fetch_raw_data() -> pd.DataFrame:
     # df = df.drop(columns=['doy', 'lights'])
 
     # Return clean features:
-    features_cols = ["AppliancesMADiff", "Appliances"]
-    df = df[features_cols]
+    # features_cols = ["AppliancesMADiff", "Appliances"]
+    # df = df[features_cols]
+    df = df.drop(columns=['date', 'lights', 'rv1', 'rv2'])
     SCALER.fit(df.values)
-    df = pd.DataFrame(SCALER.transform(df.values), columns=features_cols)
+    df = pd.DataFrame(SCALER.transform(df.values), columns=list(df.columns))
     return df
 
 
-def fetch_dataset(train_split: float = 0.8) -> tuple:
+def fetch_dataset(target_value: str, train_split: float = 0.9) -> tuple:
     """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
     # Fetch raw data:
     df = fetch_raw_data()
+    df.insert(0, target_value, df.pop(target_value))
     X = df.values
-    y = df.AppliancesMADiff.values
+    y = df[target_value].values
     features_list = []
     labels_list = []
     total_available_windows = int(df.shape[0] - SEQ_LEN - TARGETS)
@@ -143,12 +145,12 @@ def get_custom_network() -> tf.keras.models.Model:
         name='Custom-DNN',
         layers=[
             tf.keras.layers.Flatten(input_shape=[SEQ_LEN, FEATURES]),
-            tf.keras.layers.Dense(SEQ_LEN, activation='relu'),
-            tf.keras.layers.Dropout(0.2),
-            tf.keras.layers.Dense(SEQ_LEN*2, activation='relu'),
-            tf.keras.layers.Dropout(0.2),
-            tf.keras.layers.Dense(SEQ_LEN, activation='relu'),
-            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(SEQ_LEN/6, activation='relu'),
+            tf.keras.layers.Dropout(0.25),
+            tf.keras.layers.Dense(SEQ_LEN/3, activation='relu'),
+            tf.keras.layers.Dropout(0.25),
+            tf.keras.layers.Dense(SEQ_LEN/6, activation='relu'),
+            tf.keras.layers.Dropout(0.25),
             tf.keras.layers.Dense(TARGETS)
         ]
     )
@@ -204,7 +206,7 @@ def get_recurrent_network() -> tf.keras.models.Model:
     # Compile it and return it:
     model.compile(
         loss='mae',
-        optimizer=tf.keras.optimizers.RMSprop(momentum=0.9)
+        optimizer=tf.keras.optimizers.Adam()
     )
     return model
 
@@ -247,7 +249,7 @@ def plot_multiple_predictions(model: tf.keras.models.Model, n_samples: int, samp
 def dev():
     """ Test some shit. """
     # Train baseline model:
-    X_train, X_val, X_test = fetch_dataset()
+    X_train, X_val, X_test = fetch_dataset('AppliancesMADiff')
     model = get_baseline_regressor()
     model = train_model(model, X_train, X_val)
     # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
@@ -267,10 +269,10 @@ def dev():
 def main():
     """ Run script. """
     # Train baseline model:
-    X_train, X_val, X_test = fetch_dataset()
+    X_train, X_val, X_test = fetch_dataset('Appliances')
     model = get_baseline_regressor()
     model = train_model(model, X_train, X_val)
-    # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
+    # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220414-183217.h5')
 
     # Test the model:
     n_samples = 4
