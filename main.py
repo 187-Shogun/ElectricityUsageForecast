@@ -14,6 +14,7 @@ Description: <Some description>
 from matplotlib import pyplot as plt
 from datetime import datetime
 from pytz import timezone
+from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 import pandas as pd
 import numpy as np
@@ -21,16 +22,18 @@ import os
 
 
 # Global vars:
-EPOCHS = 25
-PATIENCE = 12
+EPOCHS = 100
+PATIENCE = 6
 RANDOM_SEED = 420
-SEQ_LEN = 36
+SEQ_LEN = 288
 BATCH_SIZE = 32
-TARGETS = 10
+TARGETS = 36
 FEATURES = 2
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
+SCALER = StandardScaler()
 AUTOTUNE = tf.data.AUTOTUNE
+plt.style.use('dark_background')
 
 
 def get_model_version_name(model_name: str) -> str:
@@ -42,14 +45,38 @@ def get_model_version_name(model_name: str) -> str:
 
 def fetch_raw_data() -> pd.DataFrame:
     """ Read raw data into a pandas df. """
-    # Read raw data and preprocess it:
+    # Read raw data and create some features:
     df = pd.read_csv(r"data/energy_data.csv")
     df.date = pd.to_datetime(df.date)
     df = df.sort_values('date')
-    df['ampm'] = df.date.apply(lambda x: 0 if x.hour in range(6, 18) else 1).astype(float)
-    df['doy'] = df.date.apply(lambda x: x.strftime('%j')).astype(int)
-    df = df.join(pd.get_dummies(df.doy).astype(float))
-    df = df.drop(columns=['doy', 'lights'])
+    df.insert(2, 'AppliancesLag3', df.Appliances.shift(3))
+    df.insert(3, 'AppliancesLag6', df.Appliances.shift(6))
+    df.insert(4, 'AppliancesMA3', df.Appliances.rolling(3).mean())
+    df.insert(5, 'AppliancesMA6', df.Appliances.rolling(6).mean())
+    df.insert(6, 'AppliancesDiff3', df.Appliances / df.AppliancesLag3)
+    df.insert(7, 'AppliancesDiff6', df.Appliances / df.AppliancesLag6)
+    df.insert(8, 'AppliancesMADiff', df.AppliancesMA3 / df.AppliancesMA6)
+    df.insert(9, 'AppliancesLagDiff', df.AppliancesLag3 / df.AppliancesLag6)
+    df = df.dropna()
+
+    # # Check out some data:
+    # features_cols = list(df.columns)[1:10]
+    # f, ax = plt.subplots(len(features_cols), 1)
+    # for i, x in enumerate(ax):
+    #     x.plot(df[features_cols[i]].values[9000:10_000])
+    #     x.set_title(features_cols[i])
+
+    # Some extra preprocessing:
+    # df['ampm'] = df.date.apply(lambda x: 0 if x.hour in range(6, 18) else 1).astype(float)
+    # df['doy'] = df.date.apply(lambda x: x.strftime('%j')).astype(int)
+    # df = df.join(pd.get_dummies(df.doy).astype(float))
+    # df = df.drop(columns=['doy', 'lights'])
+
+    # Return clean features:
+    features_cols = ["AppliancesMADiff", "Appliances"]
+    df = df[features_cols]
+    SCALER.fit(df.values)
+    df = pd.DataFrame(SCALER.transform(df.values), columns=features_cols)
     return df
 
 
@@ -57,12 +84,14 @@ def fetch_dataset(train_split: float = 0.8) -> tuple:
     """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
     # Fetch raw data:
     df = fetch_raw_data()
-    X = df.iloc[:, 1:FEATURES + 1].values
-    y = df[['Appliances']].values
+    X = df.values
+    y = df.AppliancesMADiff.values
     features_list = []
     labels_list = []
+    total_available_windows = int(df.shape[0] - SEQ_LEN - TARGETS)
 
-    for i in range(df.shape[0] - SEQ_LEN - TARGETS):
+    for i in range(total_available_windows):
+        # Loop over the entire sequence and create the windows:
         features = X[i: i + SEQ_LEN + TARGETS]
         labels = y[i: i + SEQ_LEN + TARGETS]
         features_list.append(features[:SEQ_LEN])
@@ -72,7 +101,7 @@ def fetch_dataset(train_split: float = 0.8) -> tuple:
     X_ds = tf.data.Dataset.from_tensor_slices(features_list)
     y_ds = tf.data.Dataset.from_tensor_slices(labels_list)
     dataset = tf.data.Dataset.zip((X_ds, y_ds)).batch(BATCH_SIZE)
-    dataset = dataset.shuffle(10_000).prefetch(AUTOTUNE)
+    dataset = dataset.shuffle(df.shape[0]).prefetch(AUTOTUNE)
 
     # Return split datasets:
     total_records = len(dataset)
@@ -91,16 +120,35 @@ def get_baseline_regressor() -> tf.keras.models.Model:
     model = tf.keras.models.Sequential(
         name='Baseline-NN',
         layers=[
-
             tf.keras.layers.Flatten(input_shape=[SEQ_LEN, FEATURES]),
-            tf.keras.layers.Dense(SEQ_LEN),
+            tf.keras.layers.Dense(SEQ_LEN, activation='relu'),
+            tf.keras.layers.Dropout(0.2),
             tf.keras.layers.Dense(TARGETS)
         ]
     )
 
     # Compile it and return it:
     model.compile(
-        loss='mse',
+        loss='mae',
+        optimizer=tf.keras.optimizers.Adam()
+    )
+    return model
+
+
+def get_recurrent_network() -> tf.keras.models.Model:
+    """ Build a recurrent network using LSTM cells. """
+    # Assemble the model:
+    model = tf.keras.models.Sequential(
+        name='LSTM-RNN',
+        layers=[
+            tf.keras.layers.LSTM(SEQ_LEN, input_shape=[SEQ_LEN, FEATURES]),
+            tf.keras.layers.Dense(TARGETS)
+        ]
+    )
+
+    # Compile it and return it:
+    model.compile(
+        loss='mae',
         optimizer=tf.keras.optimizers.Adam()
     )
     return model
@@ -118,31 +166,66 @@ def train_model(model: tf.keras.models.Model, train_ds, val_ds) -> tf.keras.mode
     return model
 
 
+def plot_prediction_results(axis, x_values: np.array, y_true: np.array, predictions: np.array):
+    """ Pass in some predictions and plot results against ground truth values. """
+    features = dict(zip(list(range(0, len(x_values))), x_values))
+    true_labels = dict(zip(list(range(len(x_values), len(x_values) + len(y_true))), y_true))
+    predicted_labels = dict(zip(list(range(len(x_values), len(x_values) + len(y_true))), predictions))
+
+    axis.plot(list(features.keys()), list(features.values()))
+    axis.plot(list(true_labels.keys()), list(true_labels.values()), 'y--')
+    axis.plot(list(predicted_labels.keys()), list(predicted_labels.values()), 'r--')
+    return axis
+
+
+def plot_multiple_predictions(model: tf.keras.models.Model, n_samples: int, samples: list):
+    """ Plot a single figure with multiple predictions picked at random. """
+    f, ax = plt.subplots(n_samples, 1)
+    for axz, sample in zip(ax, samples):
+        features = [z[0] for z in sample[0]]
+        labels = list(np.reshape(sample[1], TARGETS))
+        predictions = list(model.predict(np.reshape(sample[0], (1, SEQ_LEN, FEATURES)))[0])
+        plot_prediction_results(axz, features, labels, predictions)
+    return plt.show()
+
+
 def dev():
     """ Test some shit. """
     # Train baseline model:
     X_train, X_val, X_test = fetch_dataset()
-    # model = get_baseline_regressor()
-    # model = train_model(model, X_train, X_val)
-    model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220411-194450.h5')
+    model = get_baseline_regressor()
+    model = train_model(model, X_train, X_val)
+    # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
 
-    for x, y in X_test.take(1):
-        # Plot some predictions:
-        plt.plot(np.reshape(y[0], (-1)), 'b-')
-        plt.plot(model.predict(np.reshape(x[0], (1, SEQ_LEN, FEATURES)))[0], 'ro')
-
-    return {}
+    # Test the model:
+    n_samples = 4
+    samples = [(r[0], s[0]) for r, s in X_test.shuffle(1000).take(n_samples).as_numpy_iterator()]
+    f, ax = plt.subplots(n_samples, 1)
+    for axz, sample in zip(ax, samples):
+        features = [z[0] for z in sample[0]]
+        labels = list(np.reshape(sample[1], TARGETS))
+        predictions = list(model.predict(np.reshape(sample[0], (1, SEQ_LEN, FEATURES)))[0])
+        plot_prediction_results(axz, features, labels, predictions)
+    return plt.show()
 
 
 def main():
     """ Run script. """
-    X_train, X_val, scaler = fetch_dataset(0.9)
+    # Train baseline model:
+    X_train, X_val, X_test = fetch_dataset()
     model = get_baseline_regressor()
-    model.fit(X_train, validation_data=X_val, epochs=10)
+    model = train_model(model, X_train, X_val)
+    # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
+
+    # Test the model:
+    n_samples = 4
+    samples = [(r[0], s[0]) for r, s in X_test.shuffle(1000).take(n_samples).as_numpy_iterator()]
+    plot_multiple_predictions(model, n_samples, samples)
     return {}
 
 
 if __name__ == "__main__":
     np.random.seed(RANDOM_SEED)
+    plt.rcParams.update({'font.size': 8})
     pd.set_option("expand_frame_repr", False)
-    dev()
+    main()
