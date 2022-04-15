@@ -15,6 +15,7 @@ from matplotlib import pyplot as plt
 from datetime import datetime
 from pytz import timezone
 from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 import tensorflow as tf
 import pandas as pd
 import numpy as np
@@ -25,13 +26,14 @@ import os
 EPOCHS = 100
 PATIENCE = 10
 RANDOM_SEED = 420
-SEQ_LEN = 432
 BATCH_SIZE = 32
-TARGETS = 18
-FEATURES = 33
+SEQ_LEN = 256  # 432 = 3 Days worth of data
+TARGETS = 36  # 36 = 3 Hrs Ahead Predictions
+FEATURES = 50  # Max -> 383, Min -> 1
 CONV_SIZE = 16
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
+RAW_DATA = os.path.join(os.getcwd(), 'data', 'energy_data.csv')
 SCALER = StandardScaler()
 AUTOTUNE = tf.data.AUTOTUNE
 plt.style.use('dark_background')
@@ -44,65 +46,105 @@ def get_model_version_name(model_name: str) -> str:
     return f"{model_name}_v.{run_id}"
 
 
-def fetch_raw_data() -> pd.DataFrame:
-    """ Read raw data into a pandas df. """
-    # Read raw data and create some features:
-    df = pd.read_csv(r"data/energy_data.csv")
-    df.date = pd.to_datetime(df.date)
-    df = df.sort_values('date')
-    df.insert(2, 'AppliancesLag3', df.Appliances.shift(3))
-    df.insert(3, 'AppliancesLag6', df.Appliances.shift(6))
-    df.insert(4, 'AppliancesMA3', df.Appliances.rolling(3).mean())
-    df.insert(5, 'AppliancesMA6', df.Appliances.rolling(6).mean())
-    df.insert(6, 'AppliancesDiff3', df.Appliances / df.AppliancesLag3)
-    df.insert(7, 'AppliancesDiff6', df.Appliances / df.AppliancesLag6)
-    df.insert(8, 'AppliancesMADiff', df.AppliancesMA3 / df.AppliancesMA6)
-    df.insert(9, 'AppliancesLagDiff', df.AppliancesLag3 / df.AppliancesLag6)
-    df = df.dropna()
+def extract_features(df: pd.DataFrame, feature_name: str) -> pd.DataFrame:
+    """ Perform feature engineering on a vector and return multiple derivatives back. """
+    # Compute lag values:
+    f_index = list(df.columns).index(feature_name) + 1
+    features = dict()
 
-    # # Check out some data:
-    # features_cols = list(df.columns)[1:10]
-    # f, ax = plt.subplots(len(features_cols), 1)
-    # for i, x in enumerate(ax):
-    #     x.plot(df[features_cols[i]].values[9000:10_000])
-    #     x.set_title(features_cols[i])
+    for i in (3, 6, 12, 36):
+        cname = f"{feature_name}Lag{i}"
+        features[cname] = df[feature_name].shift(i).values
 
+    # Compute moving averages values:
+    for i in (3, 6, 12, 36):
+        cname = f"{feature_name}MA{i}"
+        features[cname] = df[feature_name].rolling(i).mean()
+
+    # Compute diff values:
+    df_features = pd.DataFrame(features)
+    df = df.iloc[:, :f_index].join(df_features).join(df.iloc[:, f_index:])
+    features = dict()
+    for i in (3, 6, 12, 36):
+        cname = f"{feature_name}Diff{i}"
+        features[cname] = df[feature_name] / df[f"{feature_name}Lag{i}"]
+
+    # Compute MA Diff values:
+    for i in (3, 6):
+        cname = f"{feature_name}MADiff{i}"
+        features[cname] = df[f"{feature_name}MA{i}"] / df[f"{feature_name}MA{i*2}"]
+
+    df_features = pd.DataFrame(features)
+    df = df.iloc[:, :f_index].join(df_features).join(df.iloc[:, f_index:])
+    return df
+
+
+def extract_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """ Extract categorical features derived from timestamps. """
     # Some extra preprocessing:
-    # df['ampm'] = df.date.apply(lambda x: 0 if x.hour in range(6, 18) else 1).astype(float)
-    # df['doy'] = df.date.apply(lambda x: x.strftime('%j')).astype(int)
-    # df = df.join(pd.get_dummies(df.doy).astype(float))
-    # df = df.drop(columns=['doy', 'lights'])
+    df['ampm'] = df.date.apply(lambda x: 0 if x.hour in range(6, 18) else 1).astype(float)
+    df['dow'] = df.date.apply(lambda x: x.strftime('%w')).astype(int)
+    df = df.join(pd.get_dummies(df.dow).astype(float))
+    df = df.drop(columns=['dow'])
+    return df
 
-    # Return clean features:
-    # features_cols = ["AppliancesMADiff", "Appliances"]
-    # df = df[features_cols]
-    df = df.drop(columns=['date', 'lights', 'rv1', 'rv2'])
+
+def fetch_raw_data(file_path: str) -> pd.DataFrame:
+    """ Read raw data into a pandas df. """
+    # Read raw data from csv file:
+    df = pd.read_csv(file_path)
+    df.date = pd.to_datetime(df.date)
+    df = extract_time_features(df)
+    df = df.sort_values('date').drop(columns=['date', 'lights', 'rv1', 'rv2'])
+    return df
+
+
+def fetch_preprocessed_data(df: pd.DataFrame, targets: list) -> pd.DataFrame:
+    """ Preprocess raw data to drop and create new features. """
+    # Perform feature engineering:
+    for col in df.columns[:-8]:  # The last 8 values are the time-derived features.
+        df = extract_features(df, col)
+
+    # Move prediction columns to the front of the dataset:
+    for i in targets:
+        df.insert(0, i, df.pop(i))
+
+    # Scale features using standard scaler:
+    df = df.replace([np.nan, np.inf, -np.inf], 0.0)
     SCALER.fit(df.values)
     df = pd.DataFrame(SCALER.transform(df.values), columns=list(df.columns))
     return df
 
 
-def fetch_dataset(target_value: str, train_split: float = 0.9) -> tuple:
-    """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
-    # Fetch raw data:
-    df = fetch_raw_data()
-    df.insert(0, target_value, df.pop(target_value))
+def get_windows(df: pd.DataFrame, targets: list) -> tuple:
+    """ Compute sliding windows over a dataframe. """
     X = df.values
-    y = df[target_value].values
+    y = df[targets].values
     features_list = []
     labels_list = []
     total_available_windows = int(df.shape[0] - SEQ_LEN - TARGETS)
 
-    for i in range(total_available_windows):
+    for i in tqdm(list(range(total_available_windows)), desc="Slicing sequence into windows"):
         # Loop over the entire sequence and create the windows:
         features = X[i: i + SEQ_LEN + TARGETS]
         labels = y[i: i + SEQ_LEN + TARGETS]
         features_list.append(features[:SEQ_LEN])
         labels_list.append(labels[SEQ_LEN:])
 
+    return features_list, labels_list
+
+
+def fetch_dataset(targets: list, train_split: float = 0.9) -> tuple:
+    """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
+    # Fetch raw data:
+    df = fetch_raw_data(RAW_DATA)
+    df = fetch_preprocessed_data(df, targets=targets)
+    df = df.iloc[:, :FEATURES]
+    X, y = get_windows(df, targets)
+
     # Configure a TF dataset:
-    X_ds = tf.data.Dataset.from_tensor_slices(features_list)
-    y_ds = tf.data.Dataset.from_tensor_slices(labels_list)
+    X_ds = tf.data.Dataset.from_tensor_slices(X)
+    y_ds = tf.data.Dataset.from_tensor_slices(y)
     dataset = tf.data.Dataset.zip((X_ds, y_ds)).batch(BATCH_SIZE)
     dataset = dataset.shuffle(df.shape[0]).prefetch(AUTOTUNE)
 
@@ -113,8 +155,19 @@ def fetch_dataset(target_value: str, train_split: float = 0.9) -> tuple:
     return (
         dataset.take(training_size),
         dataset.skip(training_size).take(val_size),
-        dataset.skip(training_size).skip(val_size)
+        dataset.skip(training_size).skip(val_size),
+        df
     )
+
+
+def viz_features():
+    """ """
+    # Check out some data:
+    # features_cols = list(df.columns)[1:10]
+    # f, ax = plt.subplots(len(features_cols), 1)
+    # for i, x in enumerate(ax):
+    #     x.plot(df[features_cols[i]].values[9000:10_000])
+    #     x.set_title(features_cols[i])
 
 
 def get_baseline_regressor() -> tf.keras.models.Model:
@@ -249,7 +302,7 @@ def plot_multiple_predictions(model: tf.keras.models.Model, n_samples: int, samp
 def dev():
     """ Test some shit. """
     # Train baseline model:
-    X_train, X_val, X_test = fetch_dataset('AppliancesMADiff')
+    X_train, X_val, X_test, df = fetch_dataset(['Appliances'])
     model = get_baseline_regressor()
     model = train_model(model, X_train, X_val)
     # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
@@ -269,7 +322,7 @@ def dev():
 def main():
     """ Run script. """
     # Train baseline model:
-    X_train, X_val, X_test = fetch_dataset('Appliances')
+    X_train, X_val, X_test, df = fetch_dataset(['Appliances'])
     model = get_baseline_regressor()
     model = train_model(model, X_train, X_val)
     # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220414-183217.h5')
@@ -285,4 +338,4 @@ if __name__ == "__main__":
     np.random.seed(RANDOM_SEED)
     plt.rcParams.update({'font.size': 8})
     pd.set_option("expand_frame_repr", False)
-    main()
+    dev()
