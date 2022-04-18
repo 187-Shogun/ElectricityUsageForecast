@@ -24,7 +24,7 @@ import os
 
 # Global vars:
 EPOCHS = 100
-PATIENCE = 8
+PATIENCE = 16
 RANDOM_SEED = 420
 BATCH_SIZE = 32
 SEQ_LEN = 432  # 432 = 3 Days worth of data
@@ -34,7 +34,7 @@ CONV_SIZE = 8
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
 RAW_DATA = os.path.join(os.getcwd(), 'data', 'energy_data.csv')
-PREDICTION_LABELS = ['AppliancesMADiff144']
+PREDICTION_LABELS = ['Appliances']
 SCALER = StandardScaler()
 AUTOTUNE = tf.data.AUTOTUNE
 plt.style.use('dark_background')
@@ -127,31 +127,31 @@ def fetch_preprocessed_data(df: pd.DataFrame, targets: list) -> pd.DataFrame:
     return df
 
 
-def get_windows(df: pd.DataFrame, targets: list) -> tuple:
+def get_windows(df: pd.DataFrame, targets: list, seq_len: int) -> tuple:
     """ Compute sliding windows over a dataframe. """
     X = df.values
     y = df[targets].values
     features_list = []
     labels_list = []
-    total_available_windows = int(df.shape[0] - SEQ_LEN - TARGETS)
+    total_available_windows = int(df.shape[0] - seq_len - len(targets))
 
     for i in tqdm(list(range(total_available_windows)), desc="Slicing sequence into windows"):
         # Loop over the entire sequence and create the windows:
-        features = X[i: i + SEQ_LEN + TARGETS]
-        labels = y[i: i + SEQ_LEN + TARGETS]
-        features_list.append(features[:SEQ_LEN])
-        labels_list.append(labels[SEQ_LEN:])
+        features = X[i: i + seq_len + len(targets)]
+        labels = y[i: i + seq_len + len(targets)]
+        features_list.append(features[:seq_len])
+        labels_list.append(labels[seq_len:])
 
     return features_list, labels_list
 
 
-def fetch_dataset(targets: list, train_split: float = 0.8) -> tuple:
+def fetch_dataset(features: int, targets: list, seq_len: int, train_split: float = 0.8) -> tuple:
     """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
     # Fetch raw data:
     df = fetch_raw_data(RAW_DATA)
     df = fetch_preprocessed_data(df, targets=targets)
-    df = df.iloc[:, :FEATURES]
-    X, y = get_windows(df, targets)
+    df = df.iloc[:, :features]
+    X, y = get_windows(df, targets, seq_len)
 
     # Configure a TF dataset:
     X_ds = tf.data.Dataset.from_tensor_slices(X)
@@ -182,15 +182,15 @@ def viz_features(df: pd.DataFrame, subset: tuple, index: int = 0):
     return plt.show()
 
 
-def get_baseline_regressor() -> tf.keras.models.Model:
+def get_baseline_regressor(sl: int, features: int, targets: int) -> tf.keras.models.Model:
     """ Build a baseline network. """
     # Assemble the model:
     model = tf.keras.models.Sequential(
-        name=f"Baseline-NN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}",
+        name=get_model_version_name(f"Baseline-NN-sl{sl}f{features}t{targets}"),
         layers=[
-            tf.keras.layers.Flatten(input_shape=[SEQ_LEN, FEATURES]),
+            tf.keras.layers.Flatten(input_shape=[sl, features]),
             tf.keras.layers.Dropout(0.25),
-            tf.keras.layers.Dense(TARGETS)
+            tf.keras.layers.Dense(targets)
         ]
     )
 
@@ -202,50 +202,18 @@ def get_baseline_regressor() -> tf.keras.models.Model:
     return model
 
 
-def get_custom_network() -> tf.keras.models.Model:
+def get_custom_network(sl: int, features: int, targets: int) -> tf.keras.models.Model:
     """ Build a custom network. """
     # Assemble the model:
     model = tf.keras.models.Sequential(
-        name=f"Custom-DNN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}",
+        name=get_model_version_name(f"Custom-DNN-sl{sl}f{features}t{targets}"),
         layers=[
-            tf.keras.layers.Conv1D(filters=SEQ_LEN // 4, kernel_size=3, input_shape=[SEQ_LEN, FEATURES]),
-            tf.keras.layers.GlobalAveragePooling1D(),
-            tf.keras.layers.Dropout(0.25),
-            tf.keras.layers.Dense(SEQ_LEN/4, activation='relu'),
-            tf.keras.layers.Dropout(0.25),
-            tf.keras.layers.Dense(SEQ_LEN/4, activation='relu'),
-            tf.keras.layers.Dropout(0.25),
-            tf.keras.layers.Dense(TARGETS)
+            tf.keras.layers.Conv1D(filters=sl // 4, kernel_size=CONV_SIZE, input_shape=[sl, features]),
+            tf.keras.layers.LSTM(sl // 2, dropout=0.2, return_sequences=True),
+            tf.keras.layers.LSTM(sl // 2, dropout=0.2),
+            tf.keras.layers.Dense(targets)
         ]
     )
-
-    # Compile it and return it:
-    model.compile(
-        loss='mae',
-        optimizer=tf.keras.optimizers.SGD(lr=0.03, momentum=0.9, nesterov=True)
-    )
-    return model
-
-
-def get_wavenet() -> tf.keras.models.Model:
-    """ Build a custom network. """
-    # Assemble the model:
-    model = tf.keras.models.Sequential(name=f"Wavenet-CNN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}")
-    model.add(tf.keras.layers.InputLayer(input_shape=[SEQ_LEN, FEATURES]))
-    for rate in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512) * 2:
-        model.add(
-            tf.keras.layers.Conv1D(
-                filters=CONV_SIZE,
-                kernel_size=2,
-                padding='causal',
-                activation='relu',
-                dilation_rate=rate
-            )
-        )
-
-    model.add(tf.keras.layers.Conv1D(filters=TARGETS, kernel_size=1))
-    model.add(tf.keras.layers.GlobalAveragePooling1D())
-    model.add(tf.keras.layers.Dense(TARGETS))
 
     # Compile it and return it:
     model.compile(
@@ -255,15 +223,43 @@ def get_wavenet() -> tf.keras.models.Model:
     return model
 
 
-def get_recurrent_network() -> tf.keras.models.Model:
+def get_wavenet(sl: int, features: int, targets: int, filter_size: int) -> tf.keras.models.Model:
+    """ Build a custom network. """
+    # Assemble the model:
+    model = tf.keras.models.Sequential(name=get_model_version_name(f"Wavenet-CNN-sl{sl}f{features}t{targets}"))
+    model.add(tf.keras.layers.InputLayer(input_shape=[sl, features]))
+    for rate in (1, 2, 4, 8, 16, 32, 64, 128, 256) * 2:
+        model.add(
+            tf.keras.layers.Conv1D(
+                filters=filter_size,
+                kernel_size=2,
+                padding='causal',
+                activation='relu',
+                dilation_rate=rate
+            )
+        )
+
+    model.add(tf.keras.layers.Conv1D(filters=targets, kernel_size=1))
+    model.add(tf.keras.layers.GlobalAveragePooling1D())
+    model.add(tf.keras.layers.Dense(targets))
+
+    # Compile it and return it:
+    model.compile(
+        loss='mae',
+        optimizer=tf.keras.optimizers.Adam()
+    )
+    return model
+
+
+def get_recurrent_network(sl: int, features: int, targets: int) -> tf.keras.models.Model:
     """ Build a recurrent network using LSTM cells. """
     # Assemble the model:
     model = tf.keras.models.Sequential(
-        name=f"LSTM-RNN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}",
+        name=get_model_version_name(f"LSTM-RNN-sl{sl}f{features}t{targets}"),
         layers=[
-            tf.keras.layers.LSTM(SEQ_LEN // 2, input_shape=[SEQ_LEN, FEATURES], dropout=0.25, return_sequences=True),
-            tf.keras.layers.LSTM(SEQ_LEN // 2, dropout=0.25),
-            tf.keras.layers.Dense(TARGETS)
+            tf.keras.layers.LSTM(sl // 2, input_shape=[sl, features], dropout=0.25, return_sequences=True),
+            tf.keras.layers.LSTM(sl // 2, dropout=0.25),
+            tf.keras.layers.Dense(targets)
         ]
     )
 
@@ -278,12 +274,11 @@ def get_recurrent_network() -> tf.keras.models.Model:
 def train_model(model: tf.keras.models.Model, train_ds, val_ds) -> tf.keras.models.Model:
     """ Pass a model and train it on a given dataset. """
     # Start training:
-    version_name = get_model_version_name(model.name)
-    tb_logs = tf.keras.callbacks.TensorBoard(os.path.join(LOGS_DIR, version_name))
+    tb_logs = tf.keras.callbacks.TensorBoard(os.path.join(LOGS_DIR, model.name))
     early_stop = tf.keras.callbacks.EarlyStopping(patience=PATIENCE, restore_best_weights=True)
     lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(factor=.5, patience=int(PATIENCE/2))
     model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, callbacks=[tb_logs, early_stop, lr_scheduler])
-    model.save(os.path.join(MODELS_DIR, f"{version_name}.h5"))
+    model.save(os.path.join(MODELS_DIR, f"{model.name}.h5"))
     return model
 
 
@@ -299,52 +294,57 @@ def plot_prediction_results(axis, x_values: np.array, y_true: np.array, predicti
     return axis
 
 
-def plot_multiple_predictions(model: tf.keras.models.Model, n_samples: int, samples: list):
+def plot_multiple_predictions(model: tf.keras.models.Model, n_samples: int, samples: list, seq_len: int):
     """ Plot a single figure with multiple predictions picked at random. """
     f, ax = plt.subplots(n_samples, 1)
     for axz, sample in zip(ax, samples):
         features = [z[0] for z in sample[0]]
         labels = list(np.reshape(sample[1], TARGETS))
-        predictions = list(model.predict(np.reshape(sample[0], (1, SEQ_LEN, FEATURES)))[0])
+        predictions = list(model.predict(np.reshape(sample[0], (1, seq_len, FEATURES)))[0])
         plot_prediction_results(axz, features, labels, predictions)
     return plt.show()
 
 
-def train_univariate_models():
+# noinspection PyShadowingNames
+def train_univariate_models() -> pd.DataFrame:
     """ Train different models on the same univariate dataset and compare results. """
-    # Train baseline model:
-    X_train, X_val, X_test, df = fetch_dataset(PREDICTION_LABELS)
-    models = [get_baseline_regressor(), get_wavenet(), get_recurrent_network(), get_custom_network()]
+    # Run a loop a training:
     results = []
-    for model in models:
-        print(f"Model: {model.name} -> Starting training...")
-        model = train_model(model, X_train, X_val)
-        results.append({
-            "model": model.name,
-            "val": model.evaluate(X_val),
-            "test": model.evaluate(X_test)
-        })
-    print_results(results)
-    return {}
 
+    for sl in {64, 128, 256, 512}:
+        SEQ_LEN = sl
+        TARGETS = sl // 8
+        models = [
+            get_baseline_regressor(SEQ_LEN, FEATURES, TARGETS),
+            get_wavenet(SEQ_LEN, FEATURES, TARGETS, CONV_SIZE),
+            get_recurrent_network(SEQ_LEN, FEATURES, TARGETS),
+            get_custom_network(SEQ_LEN, FEATURES, TARGETS)
+        ]
+        for model in models:
+            X_train, X_val, X_test, _ = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN)
+            print(f"Model: {model.name} -> Starting training...")
+            model = train_model(model, X_train, X_val)
+            results.append({
+                "model_name": model.name,
+                "model_type": "Univariate",
+                "training_params": f"SL: {SEQ_LEN}, Targets: {TARGETS}, TargetName: {PREDICTION_LABELS}",
+                "val": model.evaluate(X_val),
+                "test": model.evaluate(X_test)
+            })
 
-def print_results(results: list):
-    """ Print training results. """
-    print("="*69)
-    print("Training Results:")
-    for x in results:
-        print("="*69, '\n')
-        print(f"Model: {x.get('model')}")
-        print(f"Val Loss: {x.get('val')}")
-        print(f"Test Loss: {x.get('test')}\n")
+    # Write training results in a CSV file:
+    run_ts = datetime.now(timezone('America/Costa_Rica')).strftime("%Y%m%d-%H%M%S")
+    df = pd.DataFrame(results)
+    df.to_csv(f"results/univariate-training-results-{run_ts}.csv")
+    return df
 
 
 def dev():
     """ Test some shit. """
     # Train models:
-    X_train, X_val, X_test, df = fetch_dataset(PREDICTION_LABELS)
-    train_univariate_models()
-    model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
+    X_train, X_val, X_test, df = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN)
+    results = train_univariate_models()
+    model = tf.keras.models.load_model(f"models/{results.sort_values('test').iloc[0]['model_name']}.h5")
 
     # Test the model:
     n_samples = 4
@@ -361,15 +361,15 @@ def dev():
 def main():
     """ Run script. """
     # Train baseline model:
-    X_train, X_val, X_test, df = fetch_dataset(PREDICTION_LABELS)
-    model = get_baseline_regressor()
+    X_train, X_val, X_test, df = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN)
+    model = get_baseline_regressor(SEQ_LEN, FEATURES, TARGETS)
     model = train_model(model, X_train, X_val)
     # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220414-183217.h5')
 
     # Test the model:
     n_samples = 4
     samples = [(r[0], s[0]) for r, s in X_test.shuffle(1000).take(n_samples).as_numpy_iterator()]
-    plot_multiple_predictions(model, n_samples, samples)
+    plot_multiple_predictions(model, n_samples, samples, SEQ_LEN)
     return {}
 
 
