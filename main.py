@@ -24,16 +24,17 @@ import os
 
 # Global vars:
 EPOCHS = 100
-PATIENCE = 10
+PATIENCE = 8
 RANDOM_SEED = 420
 BATCH_SIZE = 32
-SEQ_LEN = 256  # 432 = 3 Days worth of data
+SEQ_LEN = 432  # 432 = 3 Days worth of data
 TARGETS = 36  # 36 = 3 Hrs Ahead Predictions
-FEATURES = 50  # Max -> 383, Min -> 1
-CONV_SIZE = 16
+FEATURES = 1  # Max -> 383, Min -> 1
+CONV_SIZE = 8
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
 RAW_DATA = os.path.join(os.getcwd(), 'data', 'energy_data.csv')
+PREDICTION_LABELS = ['AppliancesMADiff144']
 SCALER = StandardScaler()
 AUTOTUNE = tf.data.AUTOTUNE
 plt.style.use('dark_background')
@@ -49,15 +50,15 @@ def get_model_version_name(model_name: str) -> str:
 def extract_features(df: pd.DataFrame, feature_name: str) -> pd.DataFrame:
     """ Perform feature engineering on a vector and return multiple derivatives back. """
     # Compute lag values:
+    offsets = [1, 3, 12, 36, 144, 432]
     f_index = list(df.columns).index(feature_name) + 1
     features = dict()
 
-    for i in (3, 6, 12, 36):
+    for i in offsets:
+        # Compute lag values:
         cname = f"{feature_name}Lag{i}"
         features[cname] = df[feature_name].shift(i).values
-
-    # Compute moving averages values:
-    for i in (3, 6, 12, 36):
+        # Compute moving averages values:
         cname = f"{feature_name}MA{i}"
         features[cname] = df[feature_name].rolling(i).mean()
 
@@ -65,14 +66,23 @@ def extract_features(df: pd.DataFrame, feature_name: str) -> pd.DataFrame:
     df_features = pd.DataFrame(features)
     df = df.iloc[:, :f_index].join(df_features).join(df.iloc[:, f_index:])
     features = dict()
-    for i in (3, 6, 12, 36):
+
+    for i in offsets:
+        # Compute Diff values:
         cname = f"{feature_name}Diff{i}"
         features[cname] = df[feature_name] / df[f"{feature_name}Lag{i}"]
-
-    # Compute MA Diff values:
-    for i in (3, 6):
+        # Compute MA Diff values:
         cname = f"{feature_name}MADiff{i}"
-        features[cname] = df[f"{feature_name}MA{i}"] / df[f"{feature_name}MA{i*2}"]
+        try:
+            features[cname] = df[f"{feature_name}MA{i}"] / df[f"{feature_name}MA{offsets[offsets.index(i)+1]}"]
+        except IndexError:
+            pass
+        # Compute Lag Diff values:
+        cname = f"{feature_name}LagDiff{i}"
+        try:
+            features[cname] = df[f"{feature_name}Lag{i}"] / df[f"{feature_name}Lag{offsets[offsets.index(i)+1]}"]
+        except IndexError:
+            pass
 
     df_features = pd.DataFrame(features)
     df = df.iloc[:, :f_index].join(df_features).join(df.iloc[:, f_index:])
@@ -110,7 +120,8 @@ def fetch_preprocessed_data(df: pd.DataFrame, targets: list) -> pd.DataFrame:
         df.insert(0, i, df.pop(i))
 
     # Scale features using standard scaler:
-    df = df.replace([np.nan, np.inf, -np.inf], 0.0)
+    df = df.replace([np.nan, np.inf, -np.inf], np.nan)
+    df = df.dropna()
     SCALER.fit(df.values)
     df = pd.DataFrame(SCALER.transform(df.values), columns=list(df.columns))
     return df
@@ -134,7 +145,7 @@ def get_windows(df: pd.DataFrame, targets: list) -> tuple:
     return features_list, labels_list
 
 
-def fetch_dataset(targets: list, train_split: float = 0.9) -> tuple:
+def fetch_dataset(targets: list, train_split: float = 0.8) -> tuple:
     """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
     # Fetch raw data:
     df = fetch_raw_data(RAW_DATA)
@@ -160,25 +171,25 @@ def fetch_dataset(targets: list, train_split: float = 0.9) -> tuple:
     )
 
 
-def viz_features():
-    """ """
-    # Check out some data:
-    # features_cols = list(df.columns)[1:10]
-    # f, ax = plt.subplots(len(features_cols), 1)
-    # for i, x in enumerate(ax):
-    #     x.plot(df[features_cols[i]].values[9000:10_000])
-    #     x.set_title(features_cols[i])
+def viz_features(df: pd.DataFrame, subset: tuple, index: int = 0):
+    """ Visualize a set of features in a dataframe. """
+    features_cols = list(df.columns)[subset[0]:subset[1]]
+    f, ax = plt.subplots(len(features_cols), 1)
+
+    for i, x in enumerate(ax):
+        x.plot(df[features_cols[i]].values[index*1000:index*1000 + 1000])
+        x.set_title(features_cols[i])
+    return plt.show()
 
 
 def get_baseline_regressor() -> tf.keras.models.Model:
     """ Build a baseline network. """
     # Assemble the model:
     model = tf.keras.models.Sequential(
-        name='Baseline-NN',
+        name=f"Baseline-NN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}",
         layers=[
             tf.keras.layers.Flatten(input_shape=[SEQ_LEN, FEATURES]),
-            tf.keras.layers.Dense(SEQ_LEN, activation='relu'),
-            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dropout(0.25),
             tf.keras.layers.Dense(TARGETS)
         ]
     )
@@ -186,7 +197,7 @@ def get_baseline_regressor() -> tf.keras.models.Model:
     # Compile it and return it:
     model.compile(
         loss='mae',
-        optimizer=tf.keras.optimizers.Adam()
+        optimizer=tf.keras.optimizers.SGD(lr=0.03, momentum=0.9, nesterov=True)
     )
     return model
 
@@ -195,14 +206,14 @@ def get_custom_network() -> tf.keras.models.Model:
     """ Build a custom network. """
     # Assemble the model:
     model = tf.keras.models.Sequential(
-        name='Custom-DNN',
+        name=f"Custom-DNN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}",
         layers=[
-            tf.keras.layers.Flatten(input_shape=[SEQ_LEN, FEATURES]),
-            tf.keras.layers.Dense(SEQ_LEN/6, activation='relu'),
+            tf.keras.layers.Conv1D(filters=SEQ_LEN // 4, kernel_size=3, input_shape=[SEQ_LEN, FEATURES]),
+            tf.keras.layers.GlobalAveragePooling1D(),
             tf.keras.layers.Dropout(0.25),
-            tf.keras.layers.Dense(SEQ_LEN/3, activation='relu'),
+            tf.keras.layers.Dense(SEQ_LEN/4, activation='relu'),
             tf.keras.layers.Dropout(0.25),
-            tf.keras.layers.Dense(SEQ_LEN/6, activation='relu'),
+            tf.keras.layers.Dense(SEQ_LEN/4, activation='relu'),
             tf.keras.layers.Dropout(0.25),
             tf.keras.layers.Dense(TARGETS)
         ]
@@ -219,9 +230,9 @@ def get_custom_network() -> tf.keras.models.Model:
 def get_wavenet() -> tf.keras.models.Model:
     """ Build a custom network. """
     # Assemble the model:
-    model = tf.keras.models.Sequential(name='Wavenet-CNN')
+    model = tf.keras.models.Sequential(name=f"Wavenet-CNN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}")
     model.add(tf.keras.layers.InputLayer(input_shape=[SEQ_LEN, FEATURES]))
-    for rate in (1, 2, 4, 8, 16, 32, 64, 128) * 2:
+    for rate in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512) * 2:
         model.add(
             tf.keras.layers.Conv1D(
                 filters=CONV_SIZE,
@@ -248,10 +259,10 @@ def get_recurrent_network() -> tf.keras.models.Model:
     """ Build a recurrent network using LSTM cells. """
     # Assemble the model:
     model = tf.keras.models.Sequential(
-        name='LSTM-RNN',
+        name=f"LSTM-RNN-sl{SEQ_LEN}f{FEATURES}t{TARGETS}",
         layers=[
-            tf.keras.layers.LSTM(SEQ_LEN, input_shape=[SEQ_LEN, FEATURES], dropout=0.2, return_sequences=True),
-            tf.keras.layers.LSTM(SEQ_LEN, dropout=0.2),
+            tf.keras.layers.LSTM(SEQ_LEN // 2, input_shape=[SEQ_LEN, FEATURES], dropout=0.25, return_sequences=True),
+            tf.keras.layers.LSTM(SEQ_LEN // 2, dropout=0.25),
             tf.keras.layers.Dense(TARGETS)
         ]
     )
@@ -299,13 +310,41 @@ def plot_multiple_predictions(model: tf.keras.models.Model, n_samples: int, samp
     return plt.show()
 
 
+def train_univariate_models():
+    """ Train different models on the same univariate dataset and compare results. """
+    # Train baseline model:
+    X_train, X_val, X_test, df = fetch_dataset(PREDICTION_LABELS)
+    models = [get_baseline_regressor(), get_wavenet(), get_recurrent_network(), get_custom_network()]
+    results = []
+    for model in models:
+        print(f"Model: {model.name} -> Starting training...")
+        model = train_model(model, X_train, X_val)
+        results.append({
+            "model": model.name,
+            "val": model.evaluate(X_val),
+            "test": model.evaluate(X_test)
+        })
+    print_results(results)
+    return {}
+
+
+def print_results(results: list):
+    """ Print training results. """
+    print("="*69)
+    print("Training Results:")
+    for x in results:
+        print("="*69, '\n')
+        print(f"Model: {x.get('model')}")
+        print(f"Val Loss: {x.get('val')}")
+        print(f"Test Loss: {x.get('test')}\n")
+
+
 def dev():
     """ Test some shit. """
-    # Train baseline model:
-    X_train, X_val, X_test, df = fetch_dataset(['Appliances'])
-    model = get_baseline_regressor()
-    model = train_model(model, X_train, X_val)
-    # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
+    # Train models:
+    X_train, X_val, X_test, df = fetch_dataset(PREDICTION_LABELS)
+    train_univariate_models()
+    model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220412-194255.h5')
 
     # Test the model:
     n_samples = 4
@@ -322,7 +361,7 @@ def dev():
 def main():
     """ Run script. """
     # Train baseline model:
-    X_train, X_val, X_test, df = fetch_dataset(['Appliances'])
+    X_train, X_val, X_test, df = fetch_dataset(PREDICTION_LABELS)
     model = get_baseline_regressor()
     model = train_model(model, X_train, X_val)
     # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220414-183217.h5')
