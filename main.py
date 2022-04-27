@@ -127,31 +127,31 @@ def fetch_preprocessed_data(df: pd.DataFrame, targets: list) -> pd.DataFrame:
     return df
 
 
-def get_windows(df: pd.DataFrame, targets: list, seq_len: int) -> tuple:
+def get_windows(df: pd.DataFrame, targets: list, seq_len: int, prediction_steps: int) -> tuple:
     """ Compute sliding windows over a dataframe. """
     X = df.values
     y = df[targets].values
     features_list = []
     labels_list = []
-    total_available_windows = int(df.shape[0] - seq_len - len(targets))
+    total_available_windows = int(df.shape[0] - seq_len - prediction_steps)
 
     for i in tqdm(list(range(total_available_windows)), desc="Slicing sequence into windows"):
         # Loop over the entire sequence and create the windows:
-        features = X[i: i + seq_len + len(targets)]
-        labels = y[i: i + seq_len + len(targets)]
+        features = X[i: i + seq_len + prediction_steps]
+        labels = y[i: i + seq_len + prediction_steps]
         features_list.append(features[:seq_len])
         labels_list.append(labels[seq_len:])
 
     return features_list, labels_list
 
 
-def fetch_dataset(features: int, targets: list, seq_len: int, train_split: float = 0.8) -> tuple:
+def fetch_dataset(features: int, targets: list, seq_len: int, prediction_steps: int, train_split: float = 0.8) -> tuple:
     """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
     # Fetch raw data:
     df = fetch_raw_data(RAW_DATA)
     df = fetch_preprocessed_data(df, targets=targets)
     df = df.iloc[:, :features]
-    X, y = get_windows(df, targets, seq_len)
+    X, y = get_windows(df, targets, seq_len, prediction_steps)
 
     # Configure a TF dataset:
     X_ds = tf.data.Dataset.from_tensor_slices(X)
@@ -321,7 +321,7 @@ def train_univariate_models() -> pd.DataFrame:
             get_custom_network(SEQ_LEN, FEATURES, TARGETS)
         ]
         for model in models:
-            X_train, X_val, X_test, _ = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN)
+            X_train, X_val, X_test, _ = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN, TARGETS)
             print(f"Model: {model.name} -> Starting training...")
             model = train_model(model, X_train, X_val)
             results.append({
@@ -342,18 +342,22 @@ def train_univariate_models() -> pd.DataFrame:
 def dev():
     """ Test some shit. """
     # Train models:
-    X_train, X_val, X_test, df = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN)
-    results = train_univariate_models()
-    model = tf.keras.models.load_model(f"models/{results.sort_values('test').iloc[0]['model_name']}.h5")
+    # X_train, X_val, X_test, df = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN, TARGETS)
+    # results = train_univariate_models()
+    # model = tf.keras.models.load_model(f"models/{results.sort_values('test').iloc[0]['model_name']}.h5")
+    model = tf.keras.models.load_model(r'models/Wavenet-CNN-sl64f1t8_v.20220417-202100.h5')
 
     # Test the model:
+    sl = int(model.name.split('-')[2][2:4])
+    t = sl // 8
+    X_train, X_val, X_test, df = fetch_dataset(1, PREDICTION_LABELS, sl, t)
     n_samples = 4
     samples = [(r[0], s[0]) for r, s in X_test.shuffle(1000).take(n_samples).as_numpy_iterator()]
     f, ax = plt.subplots(n_samples, 1)
     for axz, sample in zip(ax, samples):
         features = [z[0] for z in sample[0]]
-        labels = list(np.reshape(sample[1], TARGETS))
-        predictions = list(model.predict(np.reshape(sample[0], (1, SEQ_LEN, FEATURES)))[0])
+        labels = list(np.reshape(sample[1], t))
+        predictions = list(model.predict(np.reshape(sample[0], (1, sl, 1)))[0])
         plot_prediction_results(axz, features, labels, predictions)
     return plt.show()
 
@@ -361,7 +365,7 @@ def dev():
 def main():
     """ Run script. """
     # Train baseline model:
-    X_train, X_val, X_test, df = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN)
+    X_train, X_val, X_test, df = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN, TARGETS)
     model = get_baseline_regressor(SEQ_LEN, FEATURES, TARGETS)
     model = train_model(model, X_train, X_val)
     # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220414-183217.h5')
