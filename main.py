@@ -7,9 +7,9 @@ Author: 187-Shogun
 
 Encoding: UTF-8
 
-Description: <Some description>
+Description: Build a time series model to predict the next N values for a given
+sequence of fixed lenght.
 """
-
 
 from matplotlib import pyplot as plt
 from datetime import datetime
@@ -20,21 +20,24 @@ import tensorflow as tf
 import pandas as pd
 import numpy as np
 import os
+import shutil
+import sys
 
 
-# Global vars:
+# Global vars to interact with the script:
 EPOCHS = 100
 PATIENCE = 16
 RANDOM_SEED = 420
 BATCH_SIZE = 32
 SEQ_LEN = 432  # 432 = 3 Days worth of data
 TARGETS = 36  # 36 = 3 Hrs Ahead Predictions
-FEATURES = 1  # Max -> 383, Min -> 1
+FEATURES = 50  # Max -> 383, Min -> 1
 CONV_SIZE = 8
+DATASET_URL = 'https://archive.ics.uci.edu/ml/machine-learning-databases/00374/energydata_complete.csv'
 LOGS_DIR = os.path.join(os.getcwd(), 'logs')
 MODELS_DIR = os.path.join(os.getcwd(), 'models')
-RAW_DATA = os.path.join(os.getcwd(), 'data', 'energy_data.csv')
-PREDICTION_LABELS = ['Appliances']
+REPORTS_DIR = os.path.join(os.getcwd(), 'reports')
+PREDICTION_LABELS = ['AppliancesMADiff36']  # Other interesting derivatives: AppliancesMADiff36
 SCALER = StandardScaler()
 AUTOTUNE = tf.data.AUTOTUNE
 plt.style.use('dark_background')
@@ -70,17 +73,17 @@ def extract_features(df: pd.DataFrame, feature_name: str) -> pd.DataFrame:
     for i in offsets:
         # Compute Diff values:
         cname = f"{feature_name}Diff{i}"
-        features[cname] = df[feature_name] / df[f"{feature_name}Lag{i}"]
+        features[cname] = df[feature_name] - df[f"{feature_name}Lag{i}"]
         # Compute MA Diff values:
         cname = f"{feature_name}MADiff{i}"
         try:
-            features[cname] = df[f"{feature_name}MA{i}"] / df[f"{feature_name}MA{offsets[offsets.index(i)+1]}"]
+            features[cname] = df[f"{feature_name}MA{i}"] - df[f"{feature_name}MA{offsets[offsets.index(i)+1]}"]
         except IndexError:
             pass
         # Compute Lag Diff values:
         cname = f"{feature_name}LagDiff{i}"
         try:
-            features[cname] = df[f"{feature_name}Lag{i}"] / df[f"{feature_name}Lag{offsets[offsets.index(i)+1]}"]
+            features[cname] = df[f"{feature_name}Lag{i}"] - df[f"{feature_name}Lag{offsets[offsets.index(i)+1]}"]
         except IndexError:
             pass
 
@@ -99,10 +102,10 @@ def extract_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_raw_data(file_path: str) -> pd.DataFrame:
+def fetch_raw_data() -> pd.DataFrame:
     """ Read raw data into a pandas df. """
     # Read raw data from csv file:
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(DATASET_URL)
     df.date = pd.to_datetime(df.date)
     df = extract_time_features(df)
     df = df.sort_values('date').drop(columns=['date', 'lights', 'rv1', 'rv2'])
@@ -135,7 +138,7 @@ def get_windows(df: pd.DataFrame, targets: list, seq_len: int, prediction_steps:
     labels_list = []
     total_available_windows = int(df.shape[0] - seq_len - prediction_steps)
 
-    for i in tqdm(list(range(total_available_windows)), desc="Slicing sequence into windows"):
+    for i in tqdm(list(range(total_available_windows)), desc="Slicing sequence into windows", file=sys.stdout):
         # Loop over the entire sequence and create the windows:
         features = X[i: i + seq_len + prediction_steps]
         labels = y[i: i + seq_len + prediction_steps]
@@ -148,7 +151,7 @@ def get_windows(df: pd.DataFrame, targets: list, seq_len: int, prediction_steps:
 def fetch_dataset(features: int, targets: list, seq_len: int, prediction_steps: int, train_split: float = 0.8) -> tuple:
     """ Cast pandas dataframe into TF Datasets. Returns Test, Validation and Test Datasets. """
     # Fetch raw data:
-    df = fetch_raw_data(RAW_DATA)
+    df = fetch_raw_data()
     df = fetch_preprocessed_data(df, targets=targets)
     df = df.iloc[:, :features]
     X, y = get_windows(df, targets, seq_len, prediction_steps)
@@ -296,13 +299,16 @@ def plot_prediction_results(axis, x_values: np.array, y_true: np.array, predicti
 
 def plot_multiple_predictions(model: tf.keras.models.Model, n_samples: int, samples: list, seq_len: int):
     """ Plot a single figure with multiple predictions picked at random. """
-    f, ax = plt.subplots(n_samples, 1)
+    f, ax = plt.subplots(n_samples, 1, figsize=(21, 8))
     for axz, sample in zip(ax, samples):
         features = [z[0] for z in sample[0]]
         labels = list(np.reshape(sample[1], TARGETS))
         predictions = list(model.predict(np.reshape(sample[0], (1, seq_len, FEATURES)))[0])
         plot_prediction_results(axz, features, labels, predictions)
-    return plt.show()
+
+    shutil.rmtree(REPORTS_DIR, ignore_errors=True)
+    os.makedirs(REPORTS_DIR)
+    return plt.savefig(os.path.join(REPORTS_DIR, f"{model.name}.png"))
 
 
 # noinspection PyShadowingNames
@@ -364,9 +370,11 @@ def dev():
 
 def main():
     """ Run script. """
-    # Train baseline model:
+    # Get dataset and model:
     X_train, X_val, X_test, df = fetch_dataset(FEATURES, PREDICTION_LABELS, SEQ_LEN, TARGETS)
     model = get_baseline_regressor(SEQ_LEN, FEATURES, TARGETS)
+
+    # Train a new model or load a trained one:
     model = train_model(model, X_train, X_val)
     # model = tf.keras.models.load_model(r'models/Baseline-NN_v.20220414-183217.h5')
 
@@ -381,4 +389,4 @@ if __name__ == "__main__":
     np.random.seed(RANDOM_SEED)
     plt.rcParams.update({'font.size': 8})
     pd.set_option("expand_frame_repr", False)
-    dev()
+    main()
